@@ -1,0 +1,183 @@
+rm(list=ls())
+options(useFancyQuotes = FALSE)
+setwd("F:/20181203_progress_report/img")
+#install.packages('readr')
+#install.packages('mixtools')
+#install.packages('fitdistrplus')
+#install.packages('quantmod')
+#install.packages('MALDIquant')
+#install.packages('MALDIquantForeign')
+require(readr)
+require(stats)
+require(graphics)
+require(minpack.lm)
+require(quantmod)
+require(MALDIquant)
+require(MALDIquantForeign)
+source("fwhm.r")
+require(dplyr)
+require(ggpubr)
+require(ggplot2)
+
+
+setwd("F:/20181121_Ferritin_calibration")
+
+#read sample list and annottaion
+sample_list<-read.delim2('name.txt',sep='_',header=F)
+sample_list$V3<-gsub(".txt","",sample_list$V3)
+sample_list$file<-as.character(unlist(read.delim2('name.txt',sep='\n',header=F)))
+sample_list$rowname<-substr(sample_list$V1,1,1)
+sample_list$colname<-as.numeric(substr(sample_list$V1,2,3))
+condition<-read.delim('annotation.csv',sep=',',header=T)
+condition$place<-paste0(condition$rowname,condition$colname)
+condition<-condition[,-(1:2)]
+sample_list<-merge(sample_list,condition,by.x="V1",by.y="place")
+sample_list<-sample_list[order(sample_list$rowname, sample_list$colname),]
+max_intensity<-as.numeric(0)
+#######################################################################functions###################################
+model <- function(coeffs,x){(coeffs[1] * exp( - ((x-coeffs[3])/coeffs[2])^2 ))}
+cal_func<-function(x) {return(calibration_curve$coefficients[2]*x+calibration_curve$coefficients[1])}
+find_peak<-function(spectra,leftlim,rightlim,neighbor_number) {
+  spectra<-spectra[which(spectra[,1]>leftlim&spectra[,1]<rightlim),]
+  for (i in 1:nrow(spectra)){
+    if (i <=neighbor_number || i>=(nrow(spectra)-neighbor_number)) 
+       {spectra$neighbor[i]=0
+       next}
+    spectra$neighbor[i]<-mean(spectra[(i-neighbor_number):(i+neighbor_number),2])
+  }
+  max_neighbor_intensity<-spectra[which(spectra[,2]==max(spectra[,2])),]
+  max_intensity<-max_neighbor_intensity[which(max_neighbor_intensity[,2]==max(max_neighbor_intensity[,2])),1]
+  return(max_intensity)
+}
+
+
+#function to fit the doubly charged ferritin peak, return S.D and peak height
+fit_func<-function(coeffs1,coeffs2, peak,spectra) 
+  {if (is.null(coeffs1)) {coeffs1=1.1e-2}
+  if (is.null(coeffs2)) {coeffs2=8000}
+  peak=peak
+  y_axis <- data.matrix(spectra[,2])
+  x_axis <- data.matrix(spectra[,1])
+  fit <- nlsLM(y_axis~(coeffs1 * exp( - ((x_axis-peak)/coeffs2)^2)),
+               start=list(coeffs1=coeffs1, coeffs2=coeffs2),control = nls.lm.control(maxiter=1024))
+  fit_coeffs = c(coef(fit)[1:2],peak)
+  return(fit_coeffs)
+}
+########################################################################ferritin iron content without calibration
+ferritin_list<-sample_list[grep("Ferritin",sample_list$Sample),]
+iron_before_cal<-as.data.frame(1)
+for (i in 1:nrow(ferritin_list)){
+  spectra= read.delim2(paste0(ferritin_list$file[i]), dec=".", sep="\t", header=F)
+  spectra<-spectra[-(1:2),]
+  spectra$V1<-as.numeric(as.character(spectra$V1))
+  spectra<-spectra[which(spectra$V1>315000&spectra$V1<550000),]
+
+  #plot and peak identification
+  max_intensity<-find_peak(spectra,315000,550000,5)
+  
+  fit_coeffs<-fit_func(500,70000,max_intensity,spectra)
+  b=model(fit_coeffs,spectra[,1])
+    
+  plot(spectra$V1,spectra$V2,
+       main=paste0("fwhm=", abs(round(2*1.665*fit_coeffs[2],1)),"Th, delta m=",round(fit_coeffs[3]*2-479900,1),"Th"), xlab= "m/z"
+       ,type='l',col='black',lwd=1)
+  lines(spectra$V1,b, col="blue")
+  iron_before_cal<-cbind(iron_before_cal,fit_coeffs)
+}
+
+#calculate iron loading from obtained data
+iron_before_cal<-as.data.frame(t(iron_before_cal))
+iron_before_cal<-iron_before_cal[-1,]
+iron_before_cal$replicates<-seq(1,nrow(iron_before_cal),by=1)
+iron_before_cal$iron<-(iron_before_cal$V3*2-479900)*5/527.77
+iron_before_cal$range<-iron_before_cal$coeffs2*12/527.77
+
+
+#plot iron loading data
+#dev.off()
+
+#######################################################################################external calibration
+antibody_list<-sample_list[grep("Antibody",sample_list$Sample),]
+calibration<-as.data.frame(1)
+for (i in 1:nrow(antibody_list)){
+  spectra_df= read.delim2(paste0(antibody_list$file[i]), dec=".", sep="\t", header=F)
+  spectra_df<-spectra_df[-(1:2),]
+  write.csv(spectra_df,paste0(antibody_list$V1[i],"_tmp.csv"),row.names=F)
+  spectra <- import(paste0(antibody_list$V1[i],"_tmp.csv"), centroided=F, verbose=FALSE)
+
+  peaks <- detectPeaks(spectra, method="SuperSmoother",halfWindowSize=80, SNR=3)
+
+  #antibody peaks
+  peaks_antibody<-as.data.frame(t(rbind(peaks[[1]]@mass,peaks[[1]]@intensity)))
+  colnames(peaks_antibody)<-c('mass','intensity')
+  peaks_antibody1<-peaks_antibody[which(peaks_antibody$mass>130000 & peaks_antibody$mass<150000), ]
+  peaks_antibody2<-peaks_antibody[which(peaks_antibody$mass>270000 & peaks_antibody$mass<310000), ]
+  peaks_antibody3<-peaks_antibody[which(peaks_antibody$mass>430000 & peaks_antibody$mass<460000), ]
+  peaks_antibody<-rbind(peaks_antibody1,peaks_antibody2,peaks_antibody3)
+  #plot(spectra[[1]])
+  #points(peaks_antibody, col="red", pch=4)
+  colnames(peaks_antibody)<-c(paste0('mass',i),paste0('intensity',i))
+  calibration<-cbind(calibration,peaks_antibody)
+  peaks_antibody$fwhm<-.fwhm(spectra_df,peaks_antibody)
+  #text(peaks_antibody[1:3,1],1.02*peaks_antibody[1:3,2],label=paste0('fwhm=',round((peaks_antibody$fwhm[1:3])/1000, digits = 2),'kDa'), cex= 1, pos=3,xpd=T)
+}
+
+#linear regression/external calibration curve
+calibration<-calibration[,grep('mass',colnames(calibration))]
+calibration$mean<-rowMeans(calibration)
+calibration$theo<-c('148300','297400','445700')
+#scatter plot three points
+plot(calibration$mean,calibration$theo,xlab='mean observed m/z',ylab='theoretical m/z')
+calibration_curve<-lm(formula = theo ~ mean, data = calibration)
+# abline(calibration_curve,col='red')
+# eq <- paste0("theo.m/z = ", round(calibration_curve$coefficients[2],dig=2)," obs.m/z + ",round(calibration_curve$coefficients[1],dig=2))
+# mtext(eq, 3, line=-1,cex= 0.75)
+
+######################################################################################calibrated ferritin spectra
+ferritin_list<-sample_list[grep("Ferritin",sample_list$Sample),]
+iron_after_cal<-as.data.frame(1)
+
+for (i in 1:nrow(ferritin_list)){
+  spectra= read.delim2(paste0(ferritin_list$file[i]), dec=".", sep="\t", header=F)
+  spectra<-spectra[-(1:2),]
+  spectra$V1<-as.numeric(as.character(spectra$V1))
+  spectra<-spectra[which(spectra$V1>310000&spectra$V1<600000),]
+  #external calibration using obtained calibration curve
+  spectra$V1<-cal_func(spectra$V1)
+
+  #plot and peak identification
+  max_intensity<-find_peak(spectra,315000,550000,5)
+  
+  fit_coeffs<-fit_func(500,70000,max_intensity,spectra)
+  b=model(fit_coeffs,spectra[,1])
+  
+  plot(spectra$V1,spectra$V2,
+       main=paste0("fwhm=", abs(round(2*1.665*fit_coeffs[2],1)),"Th, delta m=",round(fit_coeffs[3]*2-479900,1),"Th"), xlab= "m/z"
+       ,type='l',col='black',lwd=1)
+  lines(spectra$V1,b, col="blue")
+  iron_after_cal<-cbind(iron_after_cal,fit_coeffs)
+}
+
+iron_after_cal<-as.data.frame(t(iron_after_cal))
+iron_after_cal<-iron_after_cal[-1,]
+iron_after_cal$replicates<-seq(1,13,by=1)
+iron_after_cal$iron<-(iron_after_cal$V3*2-479900)*5/527.77
+iron_after_cal$range<-iron_after_cal$coeffs2*12/527.77
+iron_after_cal$label<-paste0(round(iron_after_cal$iron,dig=0), '\u00B1' ,round(iron_after_cal$range,dig=0))
+##############################box plot 
+cv_iron<-sd(iron_after_cal$iron)/mean(iron_after_cal$iron)*100
+
+ggplot(iron_after_cal)+
+  geom_errorbar(aes(x=replicates, ymin=iron-range, ymax=iron+range), width=0.4, colour="blue", alpha=0.9, size=1.3)+
+  geom_point(aes(x=replicates,y=iron),colour="black", alpha=0.9, size=2)+
+  xlim(0, 14)+
+  ylim(0, 6000)+
+  labs(x='replicate number',y='number of iron loaded',title='iron loading calculated from calibrated mass')+
+  geom_text(aes(label = round(iron,dig=0),x=replicates, y = (iron+range)), vjust = -2.5,size = 6)+
+  geom_text(aes(label = paste0('\u00B1',round(range,dig=0)),x=replicates, y = (iron+range)), vjust = -1.5,size=6)+
+  geom_text(aes(label=paste0('iron loading CV=',round(cv_iron,dig=2),'%'),x=12,y=6000),size=8)+
+  theme_bw(base_size = 22)+
+  ggsave('F:/20181203_progress_report/img/iron_loading_after_cal.pdf', width = 16, height = 9, dpi = 120)
+##############################a bit stat on obtained data
+
+
